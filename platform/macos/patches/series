@@ -1,0 +1,5 @@
+ungoogled-chromium/macos/fix-disabling-safebrowsing.patch
+ungoogled-chromium/macos/fix-dsymutil.patch
+ungoogled-chromium/macos/no-unknown-warnings.patch
+ungoogled-chromium/macos/use-system-python.patch
+ungoogled-chromium/macos/fix-disable-verification-token.patch

@@ -1,0 +1,3 @@
+[submodule "upstream/ungoogled-chromium"]
+	path = upstream/ungoogled-chromium
+	url = https://github.com/ungoogled-software/ungoogled-chromium.git

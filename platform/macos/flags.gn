@@ -1,0 +1,13 @@
+enable_iterator_debugging=false
+enable_mse_mpeg2ts_stream_parser=true
+enable_rust=true
+enable_swiftshader=true
+enable_updater=false
+fatal_linker_warnings=false
+ffmpeg_branding="Chrome"
+is_clang=true
+is_debug=false
+is_official_build=true
+proprietary_codecs=true
+use_siso=false
+use_sysroot=false

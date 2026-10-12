@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/scripts/lib.sh"
+
+usage() {
+  cat <<EOF
+${C_BOLD}noctis${C_RESET}: build the Noctis browser from ungoogled-chromium
+
+${C_BOLD}Usage:${C_RESET} ./noctis <command> [options]
+
+${C_BOLD}Getting started${C_RESET}
+  doctor              Check that this machine can build Noctis
+  init                Check out the pinned ungoogled-chromium submodule
+  setup [--clone] [--dev]
+                      Run fetch, prepare and configure in one go
+
+${C_BOLD}Stages${C_RESET}
+  fetch [--clone]     Download the Chromium source tarball (or git clone it)
+  prepare             Prune binaries, download toolchain, apply patches, substitute domains
+  configure [--dev]   Write args.gn and run gn gen
+  build [--dev] [ninja targets...]
+                      Compile (default target: chrome)
+  run [--dev] [browser flags...]
+                      Launch the build with an isolated profile in build/profile
+
+${C_BOLD}Housekeeping${C_RESET}
+  status              Show pinned versions and finished stages
+  reset               Delete build/src and stage markers (keeps downloads and profile)
+
+${C_BOLD}Options${C_RESET}
+  --dev               Use out/Dev: component build, much faster to link, for development
+  --clone             Fetch with git and gclient instead of the release tarball
+
+${C_BOLD}Environment${C_RESET}
+  NOCTIS_PYTHON       Python 3.11 to 3.13 interpreter to use
+  NOCTIS_ARCH         Target CPU: arm64 (default on Apple silicon) or x86_64
+EOF
+}
+
+report() {
+  local level="$1" label="$2" detail="${3:-}"
+  case "$level" in
+    ok) printf '  %s✓%s %-22s %s%s%s\n' "$C_GREEN" "$C_RESET" "$label" "$C_DIM" "$detail" "$C_RESET" ;;
+    warn) printf '  %s!%s %-22s %s\n' "$C_YELLOW" "$C_RESET" "$label" "$detail" ;;
+    fail) printf '  %s✗%s %-22s %s\n' "$C_RED" "$C_RESET" "$label" "$detail" ;;
+  esac
+}
+
+cmd_doctor() {
+  local failed=0 python xcode_path free_gb mem_gb
+
+  log "Checking build prerequisites"
+
+  if [ "$(uname -s)" = Darwin ]; then
+    report ok "macOS" "$(sw_vers -productVersion) ($HOST_CPU)"
+  else
+    report fail "macOS" "only macOS hosts are supported for now"
+    failed=1
+  fi
+
+  if [ -n "$TARGET_CPU" ]; then
+    report ok "Target CPU" "$TARGET_CPU"
+  else
+    report fail "Target CPU" "unsupported: ${NOCTIS_ARCH:-$HOST_CPU}"
+    failed=1
+  fi
+
+  xcode_path="$(xcode-select -p 2>/dev/null || true)"
+  case "$xcode_path" in
+    *Xcode*.app/*)
+      report ok "Xcode" "$(xcodebuild -version 2>/dev/null | head -1), SDK $(xcrun --show-sdk-version 2>/dev/null)"
+      if ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+        report fail "Xcode first launch" "run: sudo xcodebuild -runFirstLaunch"
+        failed=1
+      fi
+      if xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+        report ok "Metal toolchain"
+      else
+        report fail "Metal toolchain" "run: xcodebuild -downloadComponent MetalToolchain"
+        failed=1
+      fi
+      ;;
+    *)
+      report fail "Xcode" "full Xcode is required. Install it, then: sudo xcode-select -s /Applications/Xcode.app"
+      failed=1
+      ;;
+  esac
+
+  if python="$(find_python)"; then
+    report ok "Python" "$("$python" --version 2>&1) at $python"
+  else
+    report fail "Python" "need 3.11 to 3.13, run: brew install python@3.13"
+    failed=1
+  fi
+
+  if command -v ninja >/dev/null 2>&1; then
+    report ok "ninja" "$(ninja --version)"
+  else
+    report fail "ninja" "run: brew install ninja"
+    failed=1
+  fi
+
+  for tool in git curl tar; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      report ok "$tool"
+    else
+      report fail "$tool" "not found on PATH"
+      failed=1
+    fi
+  done
+
+  if [ -f "$UPSTREAM_DIR/chromium_version.txt" ]; then
+    report ok "ungoogled-chromium" "$(chromium_version)-$(upstream_revision)"
+  else
+    report fail "ungoogled-chromium" "run: ./noctis init"
+    failed=1
+  fi
+
+  free_gb="$(df -g "$NOCTIS_ROOT" | awk 'NR == 2 { print $4 }')"
+  if [ "$free_gb" -ge 120 ]; then
+    report ok "Free disk" "${free_gb} GB"
+  else
+    report warn "Free disk" "${free_gb} GB free, a full build needs about 120 GB"
+  fi
+
+  mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  if [ "$mem_gb" -ge 32 ]; then
+    report ok "Memory" "${mem_gb} GB"
+  else
+    report warn "Memory" "${mem_gb} GB, release links are slow under 32 GB. Prefer --dev while iterating"
+  fi
+
+  if command -v sccache >/dev/null 2>&1 || command -v ccache >/dev/null 2>&1; then
+    report ok "Compiler cache" "$(command -v sccache || command -v ccache)"
+  else
+    report warn "Compiler cache" "optional, speeds up rebuilds: brew install ccache"
+  fi
+
+  echo
+  if [ "$failed" = 0 ]; then
+    log "Ready to build. Next: ./noctis setup"
+  else
+    die "fix the items marked ✗ and run ./noctis doctor again"
+  fi
+}
+
+cmd_init() {
+  log "Checking out ungoogled-chromium"
+  git -C "$NOCTIS_ROOT" submodule update --init upstream/ungoogled-chromium
+  info "Chromium $(chromium_version), ungoogled-chromium revision $(upstream_revision)"
+}
+
+cmd_fetch() {
+  local clone=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --clone) clone=1 ;;
+      *) die "unknown option for fetch: $arg" ;;
+    esac
+  done
+  require_upstream
+  require_target
+  setup_env
+
+  if stamp_done fetch; then
+    log "Chromium $(chromium_version) source already fetched"
+    return
+  fi
+  [ -e "$SRC_DIR" ] && die "$SRC_DIR exists from an unfinished fetch. Run ./noctis reset first."
+
+  mkdir -p "$CACHE_DIR"
+  if [ "$clone" = 1 ]; then
+    log "Cloning Chromium $(chromium_version) with gclient"
+    local pgo=mac-arm
+    [ "$TARGET_CPU" = x64 ] && pgo=mac
+    python3 "$UPSTREAM_DIR/utils/clone.py" -p "$pgo" -o "$SRC_DIR"
+  else
+    log "Downloading Chromium $(chromium_version) source tarball (about 2 GB)"
+    python3 "$UPSTREAM_DIR/utils/downloads.py" retrieve -i "$UPSTREAM_DIR/downloads.ini" -c "$CACHE_DIR"
+    log "Unpacking source"
+    python3 "$UPSTREAM_DIR/utils/downloads.py" unpack -i "$UPSTREAM_DIR/downloads.ini" -c "$CACHE_DIR" "$SRC_DIR"
+  fi
+  stamp fetch
+}
+
+cmd_prepare() {
+  [ $# -eq 0 ] || die "prepare takes no options"
+  require_upstream
+  stamp_done fetch || die "no Chromium source yet. Run ./noctis fetch first."
+  setup_env
+
+  stage_prune
+  stage_toolchain
+  stage_patches
+  stage_domsub
+  log "Source tree is prepared"
+}
+
+cmd_configure() {
+  local dev=0 arg out
+  for arg in "$@"; do
+    case "$arg" in
+      --dev) dev=1 ;;
+      *) die "unknown option for configure: $arg" ;;
+    esac
+  done
+  require_upstream
+  require_target
+  stamp_done domsub || die "source tree is not prepared. Run ./noctis prepare first."
+  setup_env
+
+  out="$(out_dir "$dev")"
+  mkdir -p "$out"
+  gn_args "$dev" > "$out/args.gn"
+  log "Configuring ${out#"$SRC_DIR"/}"
+  sed 's/^/    /' "$out/args.gn"
+  (cd "$SRC_DIR" && buildtools/mac/gn gen "$out" --fail-on-unused-args)
+}
+
+cmd_build() {
+  local dev=0 out
+  local -a targets=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dev) dev=1 ;;
+      *) targets+=("$1") ;;
+    esac
+    shift
+  done
+  [ ${#targets[@]} -gt 0 ] || targets=(chrome)
+
+  out="$(out_dir "$dev")"
+  [ -f "$out/build.ninja" ] || die "${out#"$SRC_DIR"/} is not configured. Run ./noctis configure$([ "$dev" = 1 ] && echo " --dev")"
+  setup_env
+  log "Building ${targets[*]} in ${out#"$SRC_DIR"/}"
+  ninja -C "$out" "${targets[@]}"
+  log "Built $out/$PRODUCT_NAME.app"
+}
+
+cmd_run() {
+  local dev=0 out app
+  local -a flags=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dev) dev=1 ;;
+      *) flags+=("$1") ;;
+    esac
+    shift
+  done
+
+  out="$(out_dir "$dev")"
+  app="$out/$PRODUCT_NAME.app/Contents/MacOS/$PRODUCT_NAME"
+  [ -x "$app" ] || die "no build at $app. Run ./noctis build$([ "$dev" = 1 ] && echo " --dev")"
+  mkdir -p "$PROFILE_DIR"
+  exec "$app" --user-data-dir="$PROFILE_DIR" --use-mock-keychain ${flags[@]+"${flags[@]}"}
+}
+
+cmd_setup() {
+  local dev=0 arg
+  local -a fetch_args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --dev) dev=1 ;;
+      --clone) fetch_args+=(--clone) ;;
+      *) die "unknown option for setup: $arg" ;;
+    esac
+  done
+  cmd_fetch ${fetch_args[@]+"${fetch_args[@]}"}
+  cmd_prepare
+  if [ "$dev" = 1 ]; then cmd_configure --dev; else cmd_configure; fi
+  log "Setup complete. Next: ./noctis build$([ "$dev" = 1 ] && echo " --dev")"
+}
+
+cmd_status() {
+  local stage
+  log "$PRODUCT_NAME $(noctis_version)"
+  if [ -f "$UPSTREAM_DIR/chromium_version.txt" ]; then
+    info "Chromium            $(chromium_version)"
+    info "ungoogled-chromium  $(chromium_version)-$(upstream_revision)"
+  else
+    info "ungoogled-chromium  not checked out (./noctis init)"
+  fi
+  info "Target CPU          ${TARGET_CPU:-unsupported}"
+  echo
+  log "Stages"
+  for stage in fetch prune toolchain patches domsub; do
+    if stamp_done "$stage"; then
+      info "${C_GREEN}✓${C_RESET} $(printf '%-10s' "$stage") ${C_DIM}$(cat "$STAMP_DIR/$stage")${C_RESET}"
+    else
+      info "${C_DIM}· $stage${C_RESET}"
+    fi
+  done
+  for stage in Release Dev; do
+    if [ -f "$SRC_DIR/out/$stage/build.ninja" ]; then
+      info "${C_GREEN}✓${C_RESET} $(printf '%-10s' "out/$stage") configured"
+    fi
+  done
+}
+
+cmd_reset() {
+  [ $# -eq 0 ] || die "reset takes no options"
+  log "Removing build/src and stage markers"
+  rm -rf "$STAMP_DIR" "$DOMSUB_CACHE"
+  if [ -e "$SRC_DIR" ]; then
+    local trash="$BUILD_DIR/.trash-$$"
+    mv "$SRC_DIR" "$trash"
+    (rm -rf "$trash" >/dev/null 2>&1 &)
+    info "Deleting the old tree in the background"
+  fi
+  info "Kept $CACHE_DIR and $PROFILE_DIR"
+}
+
+command="${1:-help}"
+[ $# -gt 0 ] && shift
+case "$command" in
+  doctor) cmd_doctor "$@" ;;
+  init) cmd_init "$@" ;;
+  fetch) cmd_fetch "$@" ;;
+  prepare) cmd_prepare "$@" ;;
+  configure) cmd_configure "$@" ;;
+  build) cmd_build "$@" ;;
+  run) cmd_run "$@" ;;
+  setup) cmd_setup "$@" ;;
+  status) cmd_status "$@" ;;
+  reset) cmd_reset "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
